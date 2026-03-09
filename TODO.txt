@@ -1,0 +1,4 @@
+Database:
+  - Add player's latest (or current) ELO to players table
+  - Add a player alias table to normalize multiple names representing one person
+  - Do batch inserts instead of sequential inserts

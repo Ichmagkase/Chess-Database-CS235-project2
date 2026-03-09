@@ -1,0 +1,27 @@
+services:
+  app:
+    build: .
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: cs235_user
+      DB_PASSWORD: cs235
+      DB_NAME: chess
+    depends_on:
+      mysql:
+        condition: service_healthy
+        
+  mysql:
+    image: mysql:9.6.0
+    environment:
+      MYSQL_ROOT_PASSWORD: cs235
+      MYSQL_DATABASE: chess
+      MYSQL_USER: cs235_user
+      MYSQL_PASSWORD: cs235
+    ports:
+      - 3306:3306
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pcs235"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
