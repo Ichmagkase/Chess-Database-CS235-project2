@@ -85,40 +85,40 @@ class Database:
                 print(err)
 
     def add_game(self, game: GameCompatible) -> None:
-        print("adding a game")
-        event_id = self.get_or_create_event(game.event)
-        white_id = self.get_or_create_player(game.white_player)
-        black_id = self.get_or_create_player(game.black_player)
-        game_id = str(uuid4())
+        self.add_games([game])
 
-        with self.cnx.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO Games (
-                    game_id,
-                    event_id,
-                    date,
-                    round,
-                    white_player_id,
-                    black_player_id,
-                    result,
-                    eco,
-                    white_elo,
-                    black_elo,
-                    set_up,
-                    start_fen,
-                    ply_count,
-                    ply_limit
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """,
+    def add_games(self, games: list[GameCompatible]) -> None:
+        print(f"adding {len(games)} game(s)")
+
+        # --- Resolve events ------------------------------------------------
+        # Fetch all existing events in one query, create missing ones in batch
+        unique_events = {
+            (g.event.event_name, g.event.event_date, g.event.site): g.event
+            for g in games
+        }
+        event_id_map = self._get_or_create_events(unique_events)
+
+        # --- Resolve players -----------------------------------------------
+        unique_players = {
+            g.white_player.player_alias: g.white_player for g in games
+        } | {g.black_player.player_alias: g.black_player for g in games}
+        player_id_map = self._get_or_create_players(unique_players)
+
+        # --- Batch insert Games and Moves -----------------------------------
+        games_data = []
+        moves_data = []
+
+        for game in games:
+            game_id = str(uuid4())
+            event_key = (game.event.event_name, game.event.event_date, game.event.site)
+            games_data.append(
                 (
                     game_id,
-                    event_id,
+                    event_id_map[event_key],
                     game.date,
                     game.round,
-                    white_id,
-                    black_id,
+                    player_id_map[game.white_player.player_alias],
+                    player_id_map[game.black_player.player_alias],
                     game.result,
                     game.eco,
                     game.white_elo,
@@ -127,44 +127,122 @@ class Database:
                     game.start_fen,
                     game.ply_count,
                     game.ply_limit,
-                ),
+                )
             )
-
-            for move in game.moves:
-                cursor.execute(
-                    """
-                    INERT INTO Moves (
-                        game_id,
-                        result_board_fen,
-                        piece,
-                        move_from,
-                        move_to,
-                    )
-                    VALUES (%s, %s, %s, %s, %s);
-                """,
+            for ply_number, move in enumerate(game.moves, start=1):
+                moves_data.append(
                     (
+                        ply_number,
                         game_id,
                         move.result_board_fen,
                         move.piece,
                         move.move_from,
                         move.move_to,
-                    ),
+                    )
                 )
 
-            self.cnx.commit()
+        with self.cnx.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO Games (
+                    game_id, event_id, date, round,
+                    white_player_id, black_player_id,
+                    result, eco, white_elo, black_elo,
+                    set_up, start_fen, ply_count, ply_limit
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """,
+                games_data,
+            )
+            if moves_data:
+                cursor.executemany(
+                    """
+                    INSERT INTO Moves (
+                        ply_number, game_id, result_board_fen,
+                        piece, move_from, move_to
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                    """,
+                    moves_data,
+                )
 
-    def get_or_create_player(self, player: Player) -> str:
-        print("adding or acquiring a player ", player.player_alias)
+        self.cnx.commit()
+
+    def _get_or_create_events(self, unique_events: dict) -> dict:
+        """Returns a mapping of (event_name, event_date, site) -> event_id."""
+        if not unique_events:
+            return {}
+
+        # Fetch all existing matches in one query
+        placeholders = ", ".join(["(%s, %s, %s)"] * len(unique_events))
+        params = [v for key in unique_events for v in key]
         with self.cnx.cursor() as cursor:
             cursor.execute(
-                "SELECT player_id FROM Players WHERE player_alias = %s;",
-                (player.player_alias,),
+                f"""
+                SELECT event_id, event_name, event_date, site FROM Events
+                WHERE (event_name, event_date, site) IN ({placeholders});
+                """,
+                params,
             )
-            row = cursor.fetchone()
+            rows = cursor.fetchall()
 
-            if row:
-                return str(row[0])
+        event_id_map = {(row[1], row[2], row[3]): str(row[0]) for row in rows}
 
+        # Batch insert any missing events
+        missing = [
+            (str(uuid4()), event.event_name, event.event_date, event.site)
+            for key, event in unique_events.items()
+            if key not in event_id_map
+        ]
+        if missing:
+            with self.cnx.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO Events (event_id, event_name, event_date, site) VALUES (%s, %s, %s, %s);",
+                    missing,
+                )
+            self.cnx.commit()
+            for event_id, event_name, event_date, site in missing:
+                event_id_map[(event_name, event_date, site)] = event_id
+
+        return event_id_map
+
+    def _get_or_create_players(self, unique_players: dict) -> dict:
+        """Returns a mapping of player_alias -> player_id."""
+        if not unique_players:
+            return {}
+
+        # Fetch all existing matches in one query
+        placeholders = ", ".join(["%s"] * len(unique_players))
+        with self.cnx.cursor() as cursor:
+            cursor.execute(
+                f"SELECT player_id, player_alias FROM Players WHERE player_alias IN ({placeholders});",
+                list(unique_players.keys()),
+            )
+            rows = cursor.fetchall()
+
+        player_id_map = {row[1]: str(row[0]) for row in rows}
+
+        # Batch insert any missing players
+        missing = [
+            (str(uuid4()), alias)
+            for alias in unique_players
+            if alias not in player_id_map
+        ]
+        if missing:
+            with self.cnx.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO Players (player_id, player_alias) VALUES (%s, %s);",
+                    missing,
+                )
+            self.cnx.commit()
+            for player_id, alias in missing:
+                player_id_map[alias] = player_id
+
+        return player_id_map
+
+    def create_player(self, player: Player) -> str:
+        print("adding or acquiring a player ", player.player_alias)
+        with self.cnx.cursor() as cursor:
             player_id = str(uuid4())
             cursor.execute(
                 "INSERT INTO Players (player_id, player_alias) VALUES (%s, %s);",
@@ -174,8 +252,32 @@ class Database:
             self.cnx.commit()
             return player_id
 
-    def get_or_create_event(self, event: Event) -> str:
+    def get_player(self, player: Player) -> str:
+        with self.cnx.cursor() as cursor:
+            cursor.execute(
+                "SELECT player_id FROM Players WHERE player_alias = %s;",
+                (player.player_alias,),
+            )
+            row = cursor.fetchone()
+
+            if row:
+                return str(row[0])
+            else:
+                return ""
+
+    def create_event(self, event: Event) -> str:
         print("adding or acquiring event ", event.event_name)
+        with self.cnx.cursor() as cursor:
+            event_id = str(uuid4())
+            cursor.execute(
+                "INSERT INTO Events (event_id, event_name, site, event_date) VALUES (%s, %s, %s, %s);",
+                (event_id, event.event_name, event.event_date, event.site),
+            )
+
+            self.cnx.commit()
+            return event_id
+
+    def get_event(self, event: Event) -> str:
         with self.cnx.cursor() as cursor:
             cursor.execute(
                 "SELECT event_id FROM Events WHERE event_name = %s AND event_date = %s AND site = %s;",
@@ -185,12 +287,5 @@ class Database:
 
             if row:
                 return str(row[0])
-
-            event_id = str(uuid4())
-            cursor.execute(
-                "INSERT INTO Events (event_id, event_name, site, event_date) VALUES (%s, %s, %s, %s);",
-                (event_id, event.event_name, event.event_date, event.site),
-            )
-
-            self.cnx.commit()
-            return event_id
+            else:
+                return ""
